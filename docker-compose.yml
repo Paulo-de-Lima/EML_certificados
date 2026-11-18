@@ -1,0 +1,91 @@
+# Sobe tudo:            docker compose up --build -d
+# Acompanha os workers: docker compose logs -f worker
+# Apaga tudo (e dados): docker compose down -v
+name: certificados
+
+x-backend-env: &backend-env
+  DATABASE_URL: mysql+pymysql://app:app@mysql:3306/certificados?charset=utf8mb4
+  BROKER_URL: amqp://guest:guest@rabbitmq:5672//
+  SMTP_HOST: mailpit
+  SMTP_PORT: "1025"
+  MAILPIT_API_URL: http://mailpit:8025
+  NOME_EVENTO: Semana Acadêmica de Computação 2026
+  CARGA_HORARIA: "20"
+  MAX_TENTATIVAS: "6"
+  # Simula a latência de um servidor de e-mail real (o Mailpit responde em ~1 ms).
+  # Com 3 workers x 2 processos, 5.000 certificados levam cerca de 1,5 minuto.
+  ATRASO_SIMULADO_MS: "100"
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: certificados
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+      MYSQL_ROOT_PASSWORD: root
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3307:3306" # 3307 para não brigar com um MySQL instalado na máquina
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uapp", "-papp"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    ports:
+      - "15672:15672" # painel: http://localhost:15672 (guest / guest)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  mailpit:
+    image: axllent/mailpit:latest
+    environment:
+      MP_MAX_MESSAGES: "0" # o padrão guarda só 500 e-mails; 0 = sem limite
+    ports:
+      - "8025:8025" # caixa de entrada: http://localhost:8025
+
+  api:
+    build: ./backend
+    environment: *backend-env
+    ports:
+      - "8000:8000" # documentação: http://localhost:8000/docs
+    depends_on:
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/saude')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  worker:
+    build: ./backend
+    command: celery -A app.celery_app worker --loglevel=INFO --concurrency=2
+    environment: *backend-env
+    deploy:
+      replicas: 3 # contêineres certificados-worker-1, -2 e -3
+    depends_on:
+      api: { condition: service_healthy } # a API cria as tabelas
+      mailpit: { condition: service_started }
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80" # painel: http://localhost:5173
+    depends_on:
+      - api
+
+volumes:
+  mysql_data:
+  rabbitmq_data:
